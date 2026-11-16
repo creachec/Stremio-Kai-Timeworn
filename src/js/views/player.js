@@ -229,7 +229,7 @@ function PlayerView(opts) {
     };
     const afterPlaying = () => {
       if (!alive || forUrl !== mediaUrl) return;
-      if (hasPlayed) setTimeout(apply, 8000);
+      if (hasPlayed) setTimeout(apply, 20000);
       else setTimeout(afterPlaying, 1000);
     };
     server.streamProgress(mediaUrl).then((p) => {
@@ -247,7 +247,7 @@ function PlayerView(opts) {
     const prefAudio = (settings.audioLangs || []).map((x) => x.toLowerCase());
     const pick = ignoreRemembered ? null : rememberedSub();
     if (pick && !autoDone.sub) {
-      if (pick.kind === 'off' || pick.kind === 'embedded') {
+      if (pick.kind === 'off' || (pick.kind === 'embedded' && server.isAvailable())) {
         autoDone.sub = true;
       } else if (pick.kind === 'addon' && addonSubs) {
         const s = addonSubs.find((x) => String(x.lang).toLowerCase() === String(pick.lang).toLowerCase());
