@@ -19,6 +19,7 @@ import { t } from '../lib/i18n.js';
 
 const HIDE_MS = 5000;
 const SAVE_MS = 15000;
+const HLS_IDLE_MS = 100000;
 const LANG_NAMES = {
   por: 'Português', pob: 'Português (BR)', pt: 'Português', 'pt-br': 'Português (BR)', eng: 'Inglês', en: 'Inglês',
   spa: 'Espanhol', es: 'Espanhol', jpn: 'Japonês', ja: 'Japonês', fre: 'Francês', fra: 'Francês', fr: 'Francês',
@@ -93,6 +94,8 @@ function PlayerView(opts) {
   let currentSub = { kind: 'off' };
   let currentAudio = null;
   let triedTranscode = false;
+  let hlsRetries = 0;
+  let pausedAt = 0;
 
   const seriesInfo = () => (opts.isSeries ? { season: video.season, episode: video.episode } : null);
 
@@ -137,6 +140,7 @@ function PlayerView(opts) {
         videoEl.src = mediaUrl;
         freeBackgroundMemory();
         loadSubtitles();
+        scheduleRememberedSub();
         // Faixas embutidas só quando o usuário abre o menu: o ffprobe do servidor lê o arquivo
         // e, num torrent, rouba prioridade do trecho que está tocando.
       })
@@ -178,13 +182,81 @@ function PlayerView(opts) {
       });
   }
 
+  function subPickKey() {
+    return meta && meta.id ? String(meta.id) : '';
+  }
+
+  function rememberedSub() {
+    const key = subPickKey();
+    return key ? store.get('subPicks', {})[key] || null : null;
+  }
+
+  function rememberSub(pick) {
+    const key = subPickKey();
+    if (!key) return;
+    const all = store.get('subPicks', {});
+    delete all[key];
+    all[key] = pick;
+    const keys = Object.keys(all);
+    keys.slice(0, Math.max(0, keys.length - 200)).forEach((k) => delete all[k]);
+    store.set('subPicks', all);
+  }
+
+  function findEmbeddedSub(pick) {
+    if (!embedded || !embedded.subs.length) return -1;
+    const lang = String(pick.lang || '').toLowerCase();
+    const sameLang = (tr) => String(tr.lang || '').toLowerCase() === lang;
+    const exact = embedded.subs.findIndex((tr) => sameLang(tr) && (tr.label || '') === (pick.label || ''));
+    return exact >= 0 ? exact : embedded.subs.findIndex(sameLang);
+  }
+
+  function scheduleRememberedSub() {
+    const pick = rememberedSub();
+    if (!pick || pick.kind !== 'embedded' || !server.isAvailable()) return;
+    const forVideo = video;
+    const forUrl = mediaUrl;
+    const apply = () => {
+      if (!alive || forVideo !== video || forUrl !== mediaUrl || currentSub.kind !== 'off') return;
+      loadEmbeddedTracks().then(() => {
+        if (!alive || forVideo !== video || currentSub.kind !== 'off') return;
+        const idx = findEmbeddedSub(pick);
+        if (idx >= 0) selectEmbeddedSub(idx);
+        else {
+          autoDone.sub = false;
+          autoPick(true);
+        }
+      });
+    };
+    const afterPlaying = () => {
+      if (!alive || forUrl !== mediaUrl) return;
+      if (hasPlayed) setTimeout(apply, 8000);
+      else setTimeout(afterPlaying, 1000);
+    };
+    server.streamProgress(mediaUrl).then((p) => {
+      if (p !== null && p >= 0.999) apply();
+      else afterPlaying();
+    });
+  }
+
   // Seleção automática no estilo do Smart Track Selector do Kai (versão leve).
   // Legenda: prefere a dos addons (arquivo pequeno à parte, não mexe no vídeo). Faixas embutidas
   // só são lidas se o usuário pediu um áudio preferido, e só depois de o vídeo estar rodando.
   let autoDone = { sub: false, audio: false };
-  function autoPick() {
+  function autoPick(ignoreRemembered) {
     const prefSubs = (settings.subtitleLangs || []).map((x) => x.toLowerCase());
     const prefAudio = (settings.audioLangs || []).map((x) => x.toLowerCase());
+    const pick = ignoreRemembered ? null : rememberedSub();
+    if (pick && !autoDone.sub) {
+      if (pick.kind === 'off' || pick.kind === 'embedded') {
+        autoDone.sub = true;
+      } else if (pick.kind === 'addon' && addonSubs) {
+        const s = addonSubs.find((x) => String(x.lang).toLowerCase() === String(pick.lang).toLowerCase());
+        if (s) {
+          autoDone.sub = true;
+          selectAddonSub(s, true);
+        }
+      }
+    }
     if (!autoDone.audio && prefAudio.length && embedded && embedded.audio.length > 1) {
       autoDone.audio = true;
       const already = embedded.audio[0] && prefAudio.indexOf(String(embedded.audio[0].lang).toLowerCase()) >= 0;
@@ -227,7 +299,9 @@ function PlayerView(opts) {
     loadSegments();
   });
   videoEl.addEventListener('playing', () => {
-    if (!hasPlayed) scheduleAudioPick();
+    if (!hasPlayed) {
+      scheduleAudioPick();
+    }
     hasPlayed = true;
     showSpinner(false);
     message('');
@@ -235,9 +309,18 @@ function PlayerView(opts) {
     scheduleHide();
   });
   videoEl.addEventListener('pause', () => {
+    pausedAt = Date.now();
     updatePlayBtn();
     showControls();
     saveProgress();
+  });
+  videoEl.addEventListener('play', () => {
+    const idle = pausedAt ? Date.now() - pausedAt : 0;
+    pausedAt = 0;
+    if (isTranscoding() && hasPlayed && idle > HLS_IDLE_MS) {
+      log.info('Conversão parada por ' + Math.round(idle / 1000) + 's; abrindo sessão nova');
+      reopenAt(videoEl.currentTime);
+    }
   });
   videoEl.addEventListener('waiting', () => showSpinner(true));
   videoEl.addEventListener('canplay', () => showSpinner(false));
@@ -260,6 +343,12 @@ function PlayerView(opts) {
     const err = videoEl.error;
     log.warn('Erro de vídeo', err && err.code, mediaUrl);
     if (!alive) return;
+    if (isTranscoding() && hasPlayed && hlsRetries < 2) {
+      hlsRetries++;
+      log.info('Erro na conversão; abrindo sessão nova (' + hlsRetries + ')');
+      reopenAt(videoEl.currentTime || lastT);
+      return;
+    }
     if (!triedTranscode && server.isAvailable()) {
       fail(t('A TV não conseguiu tocar este arquivo diretamente.'), true);
     } else fail(t('A TV não conseguiu tocar este arquivo (formato ou codec não suportado).'));
@@ -451,10 +540,30 @@ function PlayerView(opts) {
     }
   }
 
+  function isTranscoding() {
+    return triedTranscode && /\/hlsv2\//.test(videoEl.currentSrc || videoEl.src || '');
+  }
+
   function reopenAt(pos) {
     showSpinner(true);
     toast(t('Reconectando ao vídeo...'));
     pendingStart = Math.max(0, pos - 1) * 1000;
+    if (isTranscoding()) {
+      try {
+        videoEl.pause();
+        videoEl.removeAttribute('src');
+        videoEl.load();
+      } catch (e) {
+        /* ignore */
+      }
+      setTimeout(() => {
+        if (!alive) return;
+        hasPlayed = false;
+        nativeOffDone = false;
+        transcode();
+      }, 300);
+      return;
+    }
     const src = videoEl.currentSrc || mediaUrl;
     try {
       videoEl.pause();
@@ -802,6 +911,11 @@ function PlayerView(opts) {
       empty: addonSubs === null ? t('Carregando legendas...') : t('Nenhuma legenda.'),
       onPick: (v) => {
         if (v.kind === 'off' || v.kind === 'embedded' || v.kind === 'addon') autoDone.sub = true;
+        if (v.kind === 'off') rememberSub({ kind: 'off' });
+        else if (v.kind === 'embedded') {
+          const tr = embedded.subs[v.index] || {};
+          rememberSub({ kind: 'embedded', lang: tr.lang || '', label: tr.label || '' });
+        } else if (v.kind === 'addon') rememberSub({ kind: 'addon', lang: v.sub.lang || '' });
         if (v.kind === 'off') {
           disableEmbeddedSubs();
           renderer.clear();
